@@ -1,0 +1,20 @@
+{
+  "name": "mimo-supervisor",
+  "version": "0.1.0",
+  "description": "\"You should know\" for Claude Code on mimo-v2.6-pro: every few steps a side pass reviews the work and tells the model, and the person, what it notices",
+  "author": {
+    "name": "2085047362sq-crypto"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "keywords": [
+    "claude-code",
+    "plugin",
+    "you-should-know",
+    "mimo",
+    "xiaomi",
+    "review"
+  ],
+  "homepage": "https://github.com/2085047362sq-crypto/mimo-supervisor",
+  "repository": "https://github.com/2085047362sq-crypto/mimo-supervisor"
+}

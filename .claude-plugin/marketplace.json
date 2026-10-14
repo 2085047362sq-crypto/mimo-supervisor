@@ -1,0 +1,16 @@
+{
+  "name": "mimo-supervisor",
+  "owner": {
+    "name": "2085047362sq-crypto"
+  },
+  "metadata": {
+    "description": "mimo-supervisor: a \"You should know\"-style reviewer for Claude Code running mimo-v2.6-pro"
+  },
+  "plugins": [
+    {
+      "name": "mimo-supervisor",
+      "source": "./",
+      "description": "\"You should know\" for Claude Code on mimo-v2.6-pro: every few steps a side pass reviews the work and tells the model, and the person, what it notices"
+    }
+  ]
+}
