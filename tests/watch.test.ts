@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { looksLikeAnswer, parseAnswer } from '../hooks/feedback'
+import { closedRows, dropAt, looksLikeAnswer, parseAnswer } from '../hooks/feedback'
 import { MAX_ITEMS, noteText, parseFindings, watchPrompt } from '../hooks/prompt'
 import { summarize } from '../hooks/register'
 
@@ -14,7 +14,6 @@ const SEEN = {
 const SEEN2 = { what: 'second', evidence: 'e2', cost: 'c2', severity: 'heads-up' as const }
 const SEEN3 = { what: 'third', evidence: 'e3', cost: 'c3', severity: 'heads-up' as const }
 const usage = { input_tokens: 300, output_tokens: 80, cache_read_input_tokens: 90000, cache_creation_input_tokens: 0 }
-const band = { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {} }
 
 // The world beneath the mod: a session with a step loop and a fork that answers
 // what `answer` says. The kit has no store beneath a plugin's session.append (it
@@ -45,12 +44,18 @@ const world = (on: Parameters<TestBody>[1]) => {
     // A fork that never answers. $.model.fork's request takes no timeoutMs, so this
     // is the case only the watcher's own guard can let go of.
     hang: false,
+    // A fork that answers only when the test releases it — the late-comer case, where
+    // the guard lets go and a newer pass starts before this one's reply arrives.
+    late: false,
     // A fork that answers with no usable reply at all — api-error, aborted, or
     // nothing-to-fork. The reason says which.
     noAnswer: undefined as undefined | string,
     // Refuse the note instead of keeping it: the documented way to turn a plugin's own
     // append away is to answer with { deny } in place of next, and nothing is stored.
     refuseNote: false,
+    // The reviewer's own model call fails (bad model id, engine refusal, api-error) —
+    // the pass must fall back to the main model and say so.
+    completeFail: false,
   }
   on('ui.log', () => ({ value: undefined }))
   on('ui.status', (_$, e) => {
@@ -71,12 +76,41 @@ const world = (on: Parameters<TestBody>[1]) => {
   on('env.get', (_$, e) => ({ value: e.name === 'ANTHROPIC_BASE_URL' ? state.baseUrl : state.model }) as never)
   on('session.model', () => ({ value: state.liveModel }) as never)
   on('session.root', () => ({ value: state.root }) as never)
-  on('model.fork', (_$, e) => {
-    forks.push(e.prompt)
+  const lateReplies: ((v: unknown) => void)[] = []
+  // The reviewer now runs on its own model over `$.model.complete`, with the
+  // conversation assembled from `$.session.messages()`; the fork is the fallback
+  // path. Both feed the same `forks` list (it counts review prompts however they
+  // were sent), while `completes`/`forkCalls` keep the paths apart for the tests
+  // that pin which one ran.
+  const completes: { model: string; prompt: string }[] = []
+  const forkCalls: string[] = []
+  const reply = () => {
     if (state.hang) return new Promise(() => undefined) as never
+    if (state.late) return new Promise((res) => lateReplies.push(res as never)) as never
     if (state.noAnswer !== undefined) return { value: { isAnswered: false, reason: state.noAnswer } } as never
     return { value: { isAnswered: true, text: state.answer, usage } } as never
+  }
+  on('model.fork', (_$, e) => {
+    forks.push(e.prompt)
+    forkCalls.push(e.prompt)
+    return reply() as never
   })
+  on('model.complete', (_$, e) => {
+    const req = e as { model?: string; prompt?: string | { text: string }[] }
+    const text = typeof req.prompt === 'string' ? req.prompt : (req.prompt ?? []).map(b => b.text).join('\n')
+    completes.push({ model: req.model ?? '', prompt: text })
+    forks.push(text)
+    if (state.completeFail) return { value: { isAnswered: false, reason: 'api-error', status: 500 } } as never
+    return reply() as never
+  })
+  // The conversation the reviewer reads on the complete path: canned, but with real
+  // text and a tool use so the transcript rendering has both shapes to carry.
+  on('session.messages', () => ({
+    value: [
+      { role: 'user', text: '帮我看看折扣该怎么算' },
+      { role: 'assistant', text: '我来查一下。', toolUses: [{ name: 'Read', input: { file: 'a.ts' }, result: '文件内容' }] },
+    ],
+  }) as never)
   // The note is what the model reads at its next step, so what actually landed is
   // worth asserting on. A hook relays the row with next(e); answering with { deny } in
   // its place refuses a plugin's own append and nothing is stored, which is how the
@@ -97,7 +131,21 @@ const world = (on: Parameters<TestBody>[1]) => {
     return h(Box, {}) as never
   })
   on('session.start', () => ({ cwd: '/' }))
-  return { clock, forks, toasts, notes, statuses, opens, state }
+  return {
+    clock,
+    forks,
+    forkCalls,
+    completes,
+    toasts,
+    notes,
+    statuses,
+    opens,
+    state,
+    // Let every waiting (late) fork answer now, with whatever `state.answer` holds.
+    releaseLate: () => {
+      while (lateReplies.length > 0) lateReplies.shift()!({ value: { isAnswered: true, text: state.answer, usage } })
+    },
+  }
 }
 
 // The plugin sits dormant until asked. This is what asks: the bare command is the
@@ -111,8 +159,10 @@ const steps = async ($: Parameters<TestBody>[0], n: number, agentId?: string) =>
   }
 }
 
-const mountBand = ($: Parameters<TestBody>[0], surface: 'terminal' | 'desktop' = 'terminal') =>
-  $.ui.mount({ plugin: 'mimo-supervisor', surface, component: 'AbovePrompt', props: band } as never)
+// The pane is the only surface now (the band above the prompt was cut — the pane
+// carried everything it showed, and the person said so).
+const mountPane = ($: Parameters<TestBody>[0], surface: 'terminal' | 'desktop' = 'terminal') =>
+  $.ui.mount({ plugin: 'mimo-supervisor', surface, component: 'Pane', requestId: 'mimo-supervisor', props: { viewport: { rows: 24, columns: 80 } } } as never)
 
 test('parses fenced, empty and malformed replies, and never keeps more than it promised', async () => {
   expect(parseFindings('```json\n' + JSON.stringify({ findings: [SEEN] }) + '\n```')?.length).toBe(1)
@@ -184,42 +234,21 @@ test('every 3 steps of the main loop a side pass looks at the work, and the band
   expect(w.notes[0]).toContain('5 = 5%')
   expect(w.toasts.length).toBe(0)
 
-  // The person sees the item above the prompt, on any surface, and can put it away.
+  // The person sees the item in the pane — on both surfaces (the band above the
+  // prompt was cut; the pane carried everything it showed).
   for (const surface of ['terminal', 'desktop'] as const) {
-    const drawn = await mountBand($, surface)
-    expect(await drawn.find({ text: /noted 1/ })).toBeDefined()
+    const drawn = await mountPane($, surface)
+    expect(await drawn.find({ text: /^正在提醒 1 条/ })).toBeDefined()
     expect(await drawn.find({ text: /5 = 5%/ })).toBeDefined()
+    // And the pane is deliberately bare: no buttons to press. Answering happens by
+    // typing (`learn 1` and friends), and the held items age out after two prompts.
+    expect(await drawn.find({ key: 'hide' })).toBeUndefined()
   }
-  const drawn = await mountBand($)
-  await drawn.press({ key: 'hide' } as never)
-  expect(await drawn.find({ key: 'hide' })).toBeUndefined()
 })
 
-// Hide only turns the drawing off; the items are still held, and until this there was
-// no way back but waiting for the next finding to un-hide it by itself.
-test('show brings the band back after Hide, and says so when there is nothing held', async ($, on) => {
-  const w = world(on)
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($)
-  await steps($, 6)
-  await w.clock.advance(10)
-  expect(await (await mountBand($)).find({ text: /noted 1/ })).toBeDefined()
-
-  await (await mountBand($)).press({ key: 'hide' } as never)
-  expect(await (await mountBand($)).find({ text: /noted/ })).toBeUndefined()
-
-  const back = await $.command.run({ command: 'mimo-supervisor', args: 'show' } as never)
-  expect(back.text).toContain('again')
-  expect(await (await mountBand($)).find({ text: /noted 1/ })).toBeDefined()
-
-  // With nothing held there is nothing to bring back, and the person is told where to look.
-  await (await mountBand($)).press({ key: 'hide' } as never)
-  await $.prompt.submit({ text: 'one', wait: false, origin: { kind: 'composer' } } as never)
-  await $.prompt.submit({ text: 'two', wait: false, origin: { kind: 'composer' } } as never)
-  const empty = await $.command.run({ command: 'mimo-supervisor', args: 'show' } as never)
-  expect(empty.text).toContain('Nothing is being held')
-  expect(empty.text).toContain('/mimo-supervisor log')
-})
+// (The band used to have a Hide button and a `show` command to undo it. Both are cut:
+// the band clears itself after two of the person's prompts or on the next finding —
+// 'the band clears after two prompts from the person' pins that.)
 
 // Nothing at all goes through $.ui.status. The host draws a status text with a warning
 // glyph in front of it and offers no way to ask for one without, and that glyph is what
@@ -262,11 +291,13 @@ test('the pane draws the watcher state and the evidence behind each item', async
     requestId: 'mimo-supervisor',
     props: { viewport: { rows: 24, columns: 80 } },
   } as never)
-  expect(await pane.find({ text: /watching/ })).toBeDefined()
+  expect(await pane.find({ text: /监视中/ })).toBeDefined()
   expect(await pane.find({ text: /mimo-v2\.6-pro/ })).toBeDefined()
-  expect(await pane.find({ text: /1 noted/ })).toBeDefined()
+  // The reviewer's own model is shown apart from the session's — they are two models.
+  expect(await pane.find({ text: /审查员 mimo-v2\.6-flash/ })).toBeDefined()
+  expect(await pane.find({ text: /报出 1 条/ })).toBeDefined()
   expect(await pane.find({ text: /5 = 5%/ })).toBeDefined()
-  expect(await pane.find({ text: /evidence:/ })).toBeDefined()
+  expect(await pane.find({ text: /证据:/ })).toBeDefined()
 })
 
 // The one path the kit used to make unreachable: a note refused on its way to the model
@@ -281,57 +312,60 @@ test('a note that is refused still reaches the person', async ($, on) => {
 
   expect(w.forks.length).toBe(1)
   expect(w.notes.length).toBe(0) // nothing was stored
-  expect(await (await mountBand($)).find({ text: /noted 1/ })).toBeDefined()
-  expect(w.toasts.at(-1)).toContain('did not reach the model')
+  expect(await (await mountPane($)).find({ text: /^正在提醒 1 条/ })).toBeDefined()
+  expect(w.toasts.at(-1)).toContain('没能送到模型')
 })
 
 // A shorter interval starts the review earlier in a turn, so it stands a better chance
 // of coming back while that turn is still running and reaching it.
-test('the interval the person sets is the one the steps count against', async ($, on) => {
+test('the interval the person sets counts, and the chain floor sits on top of it', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
   const set = await $.command.run({ command: 'mimo-supervisor', args: 'interval 5' } as never)
-  expect(set.text).toContain('every 5')
+  expect(set.text).toContain('每 5 步')
+  expect(set.text).toContain('至少要 6') // the floor is disclosed in the reply, not silent
 
+  await steps($, 5) // the first check: exactly at the interval the person picked
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(1)
+
+  // A chained check needs MIN_NEW_STEPS of new work since the last one LANDED. Here
+  // the floor (6) is larger than the interval (5), so five steps do not reach — that
+  // is the disclosed wrinkle, not a quiet widening of the interval itself.
   await steps($, 5)
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1)
+  await steps($, 1)
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(2)
 })
 
 test('an interval outside 1..24 is refused', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'interval 0' } as never)).text).toContain('Pick 1 to 24')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'interval 99' } as never)).text).toContain('Pick 1 to 24')
+  expect((await $.command.run({ command: 'mimo-supervisor', args: 'interval 0' } as never)).text).toContain('请选 1 到 24')
+  expect((await $.command.run({ command: 'mimo-supervisor', args: 'interval 99' } as never)).text).toContain('请选 1 到 24')
 })
 
-// A number the person picks is used as it stands. The widening is there to save forks,
-// which is not everyone's concern, and it must not quietly overrule what they asked
-// for — "every 3 steps" has to mean every 3 steps even while passes keep finding nothing.
-test('a fixed interval does not widen while passes find nothing', async ($, on) => {
+// A number the person picks is used as it stands, and empty passes never move it.
+// There is no adaptive widening in this build at all (the `interval auto` command and
+// the doubling behind it were cut): "every 3 steps" means the first check at exactly 3
+// and the chained ones at the chain floor (6 of new work, disclosed in the reply and
+// the README) — same cadence whether the passes find things or nothing.
+test('empty passes do not move the interval', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
   await $.command.run({ command: 'mimo-supervisor', args: 'interval 3' } as never)
   w.state.answer = '{"findings": []}'
 
-  for (let round = 0; round < 3; round++) {
-    await steps($, 3)
+  for (let round = 0; round < 5; round++) {
+    await steps($, round === 0 ? 3 : 6) // first at exactly 3; chained at the floor
     await w.clock.advance(10)
+    expect(w.forks.length).toBe(round + 1) // same cadence every round, no stretching
   }
-  expect(w.forks.length).toBe(3) // still every 3, never stretched to 6 or 12
-
-  // Back to adaptive and the widening returns: three empty passes in a row take it
-  // from 3 to 6, and the next three steps no longer reach.
-  await $.command.run({ command: 'mimo-supervisor', args: 'interval auto' } as never)
-  await steps($, 3)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(4) // quietPasses reset to 0, so still due at 3
-  await steps($, 3)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(4) // one quiet pass behind it: now due at 6
 })
 
 // A reload re-runs `register` and `session.start` and the module's own variables start
@@ -348,7 +382,7 @@ test('a pass leaves the session memory in state for the next load', async ($, on
   expect(w.forks.length).toBe(1) // raised SEEN, so nothing is quiet yet
 
   w.state.answer = '{"findings": []}'
-  await steps($, 3)
+  await steps($, 6) // chained: the floor is 6
   await w.clock.advance(10)
   expect(w.forks.length).toBe(2) // the second pass found nothing
 
@@ -362,9 +396,9 @@ test('a pass leaves the session memory in state for the next load', async ($, on
   // `1 remembered` is `raised` reaching state; `1 quiet pass` is `quietPasses` getting
   // there. `every 3` is the fixed interval — the widening only happens under
   // `interval auto`, so a quiet pass does not move this number by default.
-  expect(await pane.find({ text: /1 remembered/ })).toBeDefined()
-  expect(await pane.find({ text: /1 quiet pass/ })).toBeDefined()
-  expect(await pane.find({ text: /every 3 steps/ })).toBeDefined()
+  expect(await pane.find({ text: /去重记忆 1 条/ })).toBeDefined()
+  expect(await pane.find({ text: /连续空审查 1 次/ })).toBeDefined()
+  expect(await pane.find({ text: /每 3 步新工作检查一次/ })).toBeDefined()
 })
 
 // A note can be refused on its way to the model: the kit takes { deny } in place of
@@ -394,7 +428,7 @@ test('one pass at a time, and what it already said is not said again', async ($,
   expect(w.forks[1]).not.toContain(SEEN.cost)
 })
 
-test('the band clears after two prompts from the person', async ($, on) => {
+test('the held items age out after two prompts from the person', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
@@ -402,10 +436,12 @@ test('the band clears after two prompts from the person', async ($, on) => {
   await w.clock.advance(10)
 
   const prompt = (text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } } as never)
+  // One mount, re-read after each change: the pane is a single surface instance.
+  const pane = await mountPane($)
   await prompt('first')
-  expect(await (await mountBand($)).find({ text: /noted 1/ })).toBeDefined()
+  expect(await pane.find({ text: /^正在提醒 1 条/ })).toBeDefined()
   await prompt('second')
-  expect(await (await mountBand($)).find({ text: /noted/ })).toBeUndefined()
+  expect(await pane.find({ text: /^正在提醒/ })).toBeUndefined()
 })
 
 test('an unreadable or empty verdict shows nothing', async ($, on) => {
@@ -419,149 +455,65 @@ test('an unreadable or empty verdict shows nothing', async ($, on) => {
   await steps($, 6)
   await w.clock.advance(10)
   expect(w.forks.length).toBe(2)
-  expect(await (await mountBand($)).find({ text: /noted/ })).toBeUndefined()
+  expect(await (await mountPane($)).find({ text: /^正在提醒/ })).toBeUndefined()
   expect(w.toasts.length).toBe(0)
 })
 
-test('turning it off clears the band and stops the passes', async ($, on) => {
+test('turning it off clears the held items and stops the passes', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
   await steps($, 6)
   await w.clock.advance(10)
-  expect(await (await mountBand($)).find({ text: /noted 1/ })).toBeDefined()
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /^正在提醒 1 条/ })).toBeDefined()
 
   await $.command.run({ command: 'mimo-supervisor', args: 'off' } as never)
-  expect(await (await mountBand($)).find({ text: /noted/ })).toBeUndefined()
+  expect(await pane.find({ text: /^正在提醒/ })).toBeUndefined()
   await steps($, 12)
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1)
 })
 
-// The port's one real behavioural change: auto follows the model id, not the host.
-// A local proxy at 127.0.0.1 says nothing about which model is behind it, and this
-// plugin is for mimo — so it must not fire just because the endpoint is third-party.
-test('auto follows the model id, whatever endpoint carries it', async ($, on) => {
-  const w = world(on)
-  w.state.liveModel = 'xiaomi/mimo-v2.6-pro[1m]'
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($, 'auto')
-  await steps($, 6)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
-
-  // Same local proxy, a different model behind it: this is not what it is for.
-  w.state.liveModel = 'xiaomi/some-other-model'
-  await $.command.run({ command: 'mimo-supervisor', args: 'auto' } as never)
-  await steps($, 12)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
-
-  // Forced on, it runs for any model; auto goes back to watching only mimo.
-  await $.command.run({ command: 'mimo-supervisor', args: 'on' } as never)
-  await steps($, 6)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(2)
-  await $.command.run({ command: 'mimo-supervisor', args: 'auto' } as never)
-  await steps($, 12)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(2)
-})
+// (The model-gated `auto` mode is gone — it ran only for mimo and its command was cut
+// with it. What survives of the model detection is the naming: the reply tells the
+// person which model is being watched, and /model wins over the environment.)
 
 // The model /model shows is the truth; the environment is only what it was set from.
-// `--model` at launch changes the first and not the second, so the first has to win.
-test('the resolved model beats what the environment claims', async ($, on) => {
+// `--model` at launch changes the first and not the second, so the first has to win —
+// and the reply must name it, so the person can see they are looking at the model
+// they meant and not another one behind the same proxy.
+test('the reply names the model /model shows, not what the environment claims', async ($, on) => {
   const w = world(on)
-  w.state.model = 'xiaomi/mimo-v2.6-pro[1m]'
-  w.state.liveModel = 'xiaomi/some-other-model'
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($, 'auto')
-  await steps($, 12)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(0)
-
+  w.state.model = 'env-claims-this-model'
   w.state.liveModel = 'xiaomi/mimo-v2.6-pro[1m]'
-  await $.command.run({ command: 'mimo-supervisor', args: 'auto' } as never)
-  await steps($, 6)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
-})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const first = await start($)
+  expect(first.text).toContain('xiaomi/mimo-v2.6-pro[1m]')
+  expect(first.text).not.toContain('env-claims-this-model')
 
-// The verdict is worked out once per prompt, not once per step. Changing what the
-// world says mid-session is not a thing that happens — the person changes it, and the
-// command is how they say so — so each change here is followed by one.
-const reeval = ($: Parameters<TestBody>[0]) => $.command.run({ command: 'mimo-supervisor', args: 'auto' } as never)
-
-test('with no model named anywhere, auto falls back to the endpoint', async ($, on) => {
-  const w = world(on)
-  w.state.model = undefined
+  // With /model silent, the environment is the fallback and gets named instead.
   w.state.liveModel = undefined
-  w.state.baseUrl = undefined // unset means Anthropic's own
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($, 'auto')
-  await steps($, 12)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(0)
+  await $.command.run({ command: 'mimo-supervisor', args: 'off' } as never)
+  const second = await start($)
+  expect(second.text).toContain('env-claims-this-model')
 
-  w.state.baseUrl = 'https://api.anthropic.com'
-  await reeval($)
-  await steps($, 12)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(0)
-
-  // A host that only starts with anthropic.com is someone else's.
-  w.state.baseUrl = 'https://anthropic.com.example.net/v1'
-  await reeval($)
-  await steps($, 6)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
+  // And with nothing named anywhere — no /model, no environment — the reply says so
+  // rather than inventing a name.
+  w.state.model = undefined
+  await $.command.run({ command: 'mimo-supervisor', args: 'off' } as never)
+  const third = await start($)
+  expect(third.text).toContain('本对话已开始监视')
 })
 
-// A pass that finds nothing is the common one, and learning that costs a fork of the
-// whole transcript. So the checks spread out while they keep coming back empty.
-test('a run of passes that find nothing spreads the checks out', async ($, on) => {
-  const w = world(on)
-  w.state.answer = '{"findings": []}'
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($)
-  // The widening is opt-in: the default interval is fixed, and only `interval auto`
-  // lets a stretch of empty passes push the checks further apart.
-  await $.command.run({ command: 'mimo-supervisor', args: 'interval auto' } as never)
+// (The endpoint fallback of the old `auto` mode is gone with it: the watch/no-watch
+// decision no longer looks at ANTHROPIC_BASE_URL at all. The verdict is still worked
+// out once per prompt rather than once per step.)
 
-  await steps($, 3) // due at 3
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
-
-  await steps($, 3) // one quiet pass behind it: now due at 6, so this is not enough
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(1)
-
-  await steps($, 3)
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(2)
-})
-
-test('a pass with something to say puts the checks back to the base interval', async ($, on) => {
-  const w = world(on)
-  w.state.answer = '{"findings": []}'
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($)
-  await $.command.run({ command: 'mimo-supervisor', args: 'interval auto' } as never)
-  await steps($, 3) // due at 3; one quiet pass -> 6
-  await w.clock.advance(10)
-  await steps($, 6) // due at 6; two quiet passes -> 12
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(2)
-
-  w.state.answer = JSON.stringify({ findings: [SEEN] })
-  await steps($, 12) // due at 12, and this one has something to say
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(3)
-
-  await steps($, 3) // back to the base interval
-  await w.clock.advance(10)
-  expect(w.forks.length).toBe(4)
-})
+// (Two widening tests were here — 'a run of passes that find nothing spreads the
+// checks out' and 'a pass with something to say puts the checks back to the base
+// interval'. The widening is gone in this build; 'empty passes do not move the
+// interval' pins the replacement behaviour.)
 
 // $.model.fork's request takes no timeoutMs, so a fork that never comes back is let
 // go of by nothing but the watcher's own guard. Without it the gate stays shut and
@@ -579,7 +531,7 @@ test('nothing runs until the person asks for it', async ($, on) => {
   expect(w.notes.length).toBe(0)
 
   const asked = await start($)
-  expect(asked.text).toContain('Watching this conversation')
+  expect(asked.text).toContain('已开始监视')
   // Which model, not just "on": the person has to be able to see they are looking at
   // the one they meant, not a different model behind the same proxy.
   expect(asked.text).toContain('mimo-v2.6-pro')
@@ -679,7 +631,7 @@ test('each working directory keeps its own choice', async ($, on) => {
 // The two severities are drawn apart — `!` and bold against `~` and dimmed — so a real
 // problem is not lost among three that could wait. If this is ever dropped, the field
 // is parsed and then drawn exactly the same, which is the same as not having it.
-test('the two severities are drawn apart in the band and the pane', async ($, on) => {
+test('the two severities are drawn apart in the pane', async ($, on) => {
   const w = world(on)
   w.state.answer = JSON.stringify({ findings: [{ ...SEEN, severity: 'you-should-know' }, { ...SEEN2, severity: 'heads-up' }] })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -687,10 +639,6 @@ test('the two severities are drawn apart in the band and the pane', async ($, on
   await steps($, 3)
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1)
-
-  const band = await mountBand($)
-  expect(await band.find({ text: /^! 1\. / })).toBeDefined() // the loud one
-  expect(await band.find({ text: /^~ 2\. / })).toBeDefined() // the quiet one
 
   const pane = await $.ui.mount({
     plugin: 'mimo-supervisor',
@@ -717,15 +665,16 @@ test('saying something about a finding changes what the reviewer is told', async
 
   // "Not for me" — said in the next thing they type. The plugin reads it, takes it
   // out of the prompt (a drop, so no turn is spent on it), and the item leaves the band.
-  expect(await (await mountBand($)).find({ text: /5 = 5%/ })).toBeDefined()
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /5 = 5%/ })).toBeDefined()
   const dismissed = await said('dismiss 1')
   // Dropped rather than forwarded: the line was for the plugin, and the drop reason
   // is what the person sees in place of the prompt they typed.
-  expect((dismissed as { drop?: string }).drop ?? '').toContain('not relevant')
-  expect(await (await mountBand($)).find({ text: /5 = 5%/ })).toBeUndefined()
+  expect((dismissed as { drop?: string }).drop ?? '').toContain('不相关')
+  expect(await pane.find({ text: /5 = 5%/ })).toBeUndefined()
 
   w.state.answer = '{"findings": []}'
-  await steps($, 3)
+  await steps($, 6) // chained: the floor is 6
   await w.clock.advance(10)
   const afterDismiss = w.forks.at(-1) ?? ''
   expect(afterDismiss).toContain('<not-relevant>')
@@ -734,12 +683,12 @@ test('saying something about a finding changes what the reviewer is told', async
   // "I want more of this" reaches the prompt too — and, unlike the raised list, it is
   // a reason to bring things up rather than leave them alone.
   w.state.answer = JSON.stringify({ findings: [{ ...SEEN2, what: 'a kind of thing' }] })
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   await said('more like 1')
 
   w.state.answer = '{"findings": []}'
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   const afterAppreciate = w.forks.at(-1) ?? ''
   expect(afterAppreciate).toContain('<useful-to-them>')
@@ -775,7 +724,7 @@ test('a feedback line with nothing on screen is dropped, not sent to the model',
   await start($)
 
   const empty = await $.prompt.submit({ text: 'learn 1', wait: false, origin: { kind: 'composer' } } as never)
-  expect((empty as { drop?: string }).drop ?? '').toContain('nothing on screen')
+  expect((empty as { drop?: string }).drop ?? '').toContain('没有条目')
   // And an ordinary prompt still goes through untouched.
   const normal = await $.prompt.submit({ text: 'now read the config', wait: false, origin: { kind: 'composer' } } as never)
   expect((normal as { drop?: string }).drop ?? '').toBe('')
@@ -811,7 +760,7 @@ test('ordinary replies are never eaten', async () => {
   expect(looksLikeAnswer('learn')).toBe(true)
 })
 
-test('learn closes what is on screen and it never comes back', async ($, on) => {
+test('learn 1 closes what is on screen and it never comes back', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
@@ -819,13 +768,16 @@ test('learn closes what is on screen and it never comes back', async ($, on) => 
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1) // raised SEEN
 
-  const closed = await $.command.run({ command: 'mimo-supervisor', args: 'learn' } as never)
-  expect(closed.text).toContain('Closed 1')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'learned' } as never)).text).toContain(SEEN.what)
+  // "I know this one" — typed in the next message, taken out by the plugin (a drop).
+  const closed = await $.prompt.submit({ text: 'learn 1', wait: false, origin: { kind: 'composer' } } as never)
+  expect((closed as { drop?: string }).drop ?? '').toContain('已关闭')
+  // The closed list lives in `log` now — that is where the person looks for it.
+  const log = (await $.command.run({ command: 'mimo-supervisor', args: 'log' } as never)) as { text: string }
+  expect(log.text).toContain(SEEN.what)
 
   // The next pass is told, in stronger terms than "already raised", to leave it alone.
   w.state.answer = '{"findings": []}'
-  await steps($, 3)
+  await steps($, 6) // chained: the floor is 6
   await w.clock.advance(10)
   const last = w.forks.at(-1) ?? ''
   expect(last).toContain('<known>')
@@ -833,9 +785,10 @@ test('learn closes what is on screen and it never comes back', async ($, on) => 
   expect(last).toContain('Never raise anything in the list below')
 })
 
-// The other two signals work the same way from the command line — `learn` is not
-// the only one with a command, and an untested command is one nobody has ever run.
-test('dismiss and appreciate work from the command line too', async ($, on) => {
+// The one undo: `undo <n>` reopens a closed item from whichever of the three lists it
+// sits in, and the sentence is also lifted out of "already raised" — otherwise the
+// reviewer would keep skipping it and the reopen would be a promise it never keeps.
+test('undo reopens a closed item, whatever kind it was', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
@@ -843,34 +796,41 @@ test('dismiss and appreciate work from the command line too', async ($, on) => {
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1) // one item on screen
 
-  const dismissed = await $.command.run({ command: 'mimo-supervisor', args: 'dismiss' } as never)
-  expect(dismissed.text).toContain('Marked 1')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'dismissed' } as never)).text).toContain(SEEN.what)
+  // Close it as "not for me"; the closed list is in `log`, tagged by kind.
+  await $.prompt.submit({ text: 'dismiss 1', wait: false, origin: { kind: 'composer' } } as never)
+  const closed = (await $.command.run({ command: 'mimo-supervisor', args: 'log' } as never)) as { text: string }
+  expect(closed.text).toContain('[不相关]')
+  expect(closed.text).toContain(SEEN.what)
 
-  w.state.answer = JSON.stringify({ findings: [{ ...SEEN2, what: 'a kind of thing' }] })
-  await steps($, 3)
+  // Undo it — one numbering across the lists.
+  const back = await $.command.run({ command: 'mimo-supervisor', args: 'undo 1' } as never)
+  expect(back.text).toContain('已放出')
+  expect(back.text).toContain(SEEN.what)
+  const log = (await $.command.run({ command: 'mimo-supervisor', args: 'log' } as never)) as { text: string }
+  expect(log.text).not.toContain('[不相关]')
+
+  // And the reviewer may raise it again: the reopen lifted it out of `raised` too.
+  w.state.answer = JSON.stringify({ findings: [SEEN] })
+  await steps($, 6) // chained: the floor is 6
   await w.clock.advance(10)
-  const appreciated = await $.command.run({ command: 'mimo-supervisor', args: 'appreciate' } as never)
-  expect(appreciated.text).toContain('Noted')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'appreciated' } as never)).text).toContain('a kind of thing')
-
-  // And both undo.
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'undismiss 1' } as never)).text).toContain('Reopened')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'unappreciate 1' } as never)).text).toContain('Reopened')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'dismissed' } as never)).text).toContain('Nothing marked')
+  expect(w.forks.at(-1) ?? '').not.toContain('<already-raised>')
 })
 
-test('unlearn reopens one so it can be raised again', async ($, on) => {
-  const w = world(on)
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await start($)
-  await steps($, 3)
-  await w.clock.advance(10)
-  await $.command.run({ command: 'mimo-supervisor', args: 'learn' } as never)
-
-  const back = await $.command.run({ command: 'mimo-supervisor', args: 'unlearn 1' } as never)
-  expect(back.text).toContain('Reopened')
-  expect((await $.command.run({ command: 'mimo-supervisor', args: 'learned' } as never)).text).toContain('Nothing closed')
+// Closed items are numbered oldest-closed-first, so what `undo 2` points at today is
+// still what it points at after more things are closed. A list-order concatenation
+// would silently shift every later number the moment one more item landed.
+test('closed items are numbered oldest first, so undo numbers do not shift', async () => {
+  const lists = {
+    learned: [{ what: 'old-learn', at: 100 }],
+    dismissed: [{ what: 'new-dismiss', at: 300 }, { what: 'mid-dismiss', at: 200 }],
+    appreciated: [],
+  }
+  expect(closedRows(lists).map(r => r.entry.what)).toEqual(['old-learn', 'mid-dismiss', 'new-dismiss'])
+  // A newly closed item lands at the tail — the earlier numbers stay put.
+  const grown = { ...lists, appreciated: [{ what: 'newest', at: 400 }] }
+  expect(closedRows(grown).map(r => r.entry.what)).toEqual(['old-learn', 'mid-dismiss', 'new-dismiss', 'newest'])
+  expect(dropAt(grown, 1)?.entry.what).toBe('mid-dismiss')
+  expect(dropAt(grown, 1)?.kind).toBe('dismissed')
 })
 
 // 审查是旁路：它坏了不会报错，只是再也不提醒。连续几次没有结论就得说一声，
@@ -880,25 +840,26 @@ test('a reviewer that stops making sense says so', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await start($)
 
+  // 首查 3 步；此后每次链式检查要 6 步新工作（chain floor）。
   w.state.answer = 'not json at all'
   await steps($, 3)
   await w.clock.advance(10)
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   expect(w.toasts.length).toBe(0)   // 一两次不值得吵
 
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   expect(w.toasts.at(-1) ?? '').toContain('没给出结论')
 
   // 一旦又给出结论，计数清零，不重复提醒。
   w.state.answer = '{"findings": []}'
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   w.state.answer = 'still not json'
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
-  await steps($, 3)
+  await steps($, 6)
   await w.clock.advance(10)
   expect(w.toasts.filter(t => t.includes('没给出结论')).length).toBe(1)
 })
@@ -912,12 +873,12 @@ test('a fork that keeps failing is reported, one with nothing to fork is not', a
   await start($)
 
   w.state.noAnswer = 'api-error'
-  for (let i = 0; i < 3; i++) { await steps($, 3); await w.clock.advance(10) }
+  for (let i = 0; i < 3; i++) { await steps($, i === 0 ? 3 : 6); await w.clock.advance(10) } // 首查 3,链条 6
   expect(w.toasts.at(-1) ?? '').toContain('没结果')
 
   // 清零后，nothing-to-fork 不该累积成警报。
   w.state.noAnswer = 'nothing-to-fork'
-  for (let i = 0; i < 6; i++) { await steps($, 3); await w.clock.advance(10) }
+  for (let i = 0; i < 6; i++) { await steps($, 6); await w.clock.advance(10) }
   expect(w.toasts.filter(t => t.includes('没结果')).length).toBe(1)
 })
 
@@ -934,11 +895,145 @@ test('a fork that never comes back gives up and lets the next one run', async ($
   await w.clock.advance(10)
   expect(w.forks.length).toBe(1)
 
-  await w.clock.advance(120_000) // the guard lets go
+  await w.clock.advance(600_000) // the guard lets go (600s: real passes run minutes, see docs §7.4)
   w.state.hang = false
   await steps($, 6)
   await w.clock.advance(10)
   expect(w.forks.length).toBe(2)
+})
+
+// A pass that comes back late is recorded as superseded, not silently lost. Its
+// findings are not delivered — a late note would collide with the newer pass's — but
+// the pass and what it saw are kept, so the numbers do not lie about how much was
+// reviewed and how much was dropped. This is how the old 120s guard used to eat
+// results invisibly: history only ever held passes that happened to still be newest.
+test('a pass that comes back late is recorded as superseded, not silently lost', async ($, on) => {
+  const w = world(on)
+  w.state.late = true
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  await steps($, 3)
+  await w.clock.advance(10) // the first pass forks and waits (late)
+  expect(w.forks.length).toBe(1)
+
+  await w.clock.advance(600_000) // its guard lets go; the slot is free again
+  w.state.late = false
+  await steps($, 3) // six new steps since the first pass went out → a second pass runs
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(2)
+
+  w.releaseLate() // the first reply finally arrives — a newer pass owns the state
+  await w.clock.advance(10)
+
+  // Not delivered twice: only the newer pass's note reached the model.
+  expect(w.notes.length).toBe(1)
+  // But recorded: the log counts it as superseded and the aggregate keeps it forever.
+  const log = (await $.command.run({ command: 'mimo-supervisor', args: 'log' } as never)) as { text: string }
+  expect(log.text).toContain('1 次被作废')
+  expect(log.text).toContain('累计')
+  // The bare command is the switch, and its reply carries the stats — that is the
+  // command people actually type. (Not `on`: there is no `on` spelling in this build.)
+  const status = (await $.command.run({ command: 'mimo-supervisor', args: '' } as never)) as { text: string }
+  expect(status.text).toContain('累计:审查 1 次(作废 1 次)')
+})
+
+// The delta gate: a chained check needs MIN_NEW_STEPS of new work since the last one
+// LANDED, so a slow pass followed by an instant one does not produce two passes poking
+// at one wave of work. The first check of a conversation honours `every` exactly.
+test('a chained check waits for new work since the last one landed', async ($, on) => {
+  const w = world(on)
+  w.state.answer = JSON.stringify({ findings: [] })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  await steps($, 3) // first check: exactly at the interval
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(1)
+
+  await steps($, 5) // five new steps — one short of the chained floor
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(1)
+
+  await steps($, 1) // the sixth lands the chained check
+  await w.clock.advance(10)
+  expect(w.forks.length).toBe(2)
+})
+
+// The reviewer runs on its own model (flash) over $.model.complete, with the
+// conversation assembled from $.session.messages() — a fork cannot change models,
+// it re-sends the main thread's request. The transcript goes first and is cache-
+// marked (it only grows, so the shared prefix still hits); the review instructions
+// come last and vary with the already-raised list.
+test('the reviewer runs on its own model over the assembled conversation', async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  await steps($, 3)
+  await w.clock.advance(10)
+
+  expect(w.completes.length).toBe(1)
+  // Not pinned to an exact id: the flash id shape is confirmed with the person's
+  // /model line. What matters here: the reviewer's own model, and the same one the
+  // `reviewer` command reports.
+  expect(w.completes[0].model).toContain('flash')
+  expect((await $.command.run({ command: 'mimo-supervisor', args: 'reviewer' } as never)).text).toContain(w.completes[0].model)
+  // The conversation, and the review instructions after it.
+  expect(w.completes[0].prompt).toContain('帮我看看折扣该怎么算')
+  expect(w.completes[0].prompt).toContain('(调用 Read')
+  expect(w.completes[0].prompt).toContain('The user reads the final answers')
+  // Nothing went through the fork — the main model was not asked at all.
+  expect(w.forkCalls.length).toBe(0)
+  expect(w.notes.length).toBe(1)
+})
+
+// A reviewer model that fails (wrong id, engine refusal, api-error) falls back to the
+// main model for that pass and says so once — a reviewer that switched models and
+// died quietly is the worst kind of broken.
+test('a reviewer model that fails falls back to the main model and says so', async ($, on) => {
+  const w = world(on)
+  w.state.completeFail = true
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  await steps($, 3)
+  await w.clock.advance(10)
+
+  // One pass: one failed attempt on the reviewer's model, one fallback on the fork
+  // (both review calls, so `forks` sees two entries — the paths are counted apart).
+  expect(w.completes.length).toBeGreaterThan(0) // tried the id variants
+  expect(w.forkCalls.length).toBe(1)
+  expect(w.notes.length).toBe(1) // and its findings still landed
+  expect(w.toasts.at(-1) ?? '').toContain('已回退主模型')
+
+  // Said once, not every pass.
+  await steps($, 6)
+  await w.clock.advance(10)
+  expect(w.toasts.filter(t => t.includes('已回退主模型')).length).toBe(1)
+})
+
+// `reviewer mimo` puts the fork back — the escape hatch when the second model's
+// output turns out noisier (the restraint prompt was tuned on the main model).
+test('reviewer mimo goes back to the fork path', async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  expect((await $.command.run({ command: 'mimo-supervisor', args: 'reviewer' } as never)).text).toContain('flash')
+
+  await $.command.run({ command: 'mimo-supervisor', args: 'reviewer mimo' } as never)
+  await steps($, 3)
+  await w.clock.advance(10)
+  expect(w.forkCalls.length).toBe(1)
+  expect(w.completes.length).toBe(0)
+})
+
+test('a reviewer id is taken verbatim, case included', async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await start($)
+  // Model ids are case-sensitive: the command must not lowercase what it is given.
+  const set = (await $.command.run({ command: 'mimo-supervisor', args: 'reviewer Mimo-Flash[2M]' } as never)) as { text: string }
+  expect(set.text).toContain('Mimo-Flash[2M]')
+  await steps($, 3)
+  await w.clock.advance(10)
+  expect(w.completes[0].model).toBe('Mimo-Flash[2M]')
 })
 
 test('the review prompt matches already-raised by lesson, not by wording', async () => {
@@ -960,15 +1055,31 @@ test('the review prompt restrains severity and stops re-reporting a process less
 })
 
 test('the command reports what the passes were worth, not a guess', () => {
-  expect(summarize([])).toBe('No passes yet.')
+  expect(summarize([])).toBe('还没有审查记录。')
   const line = summarize([
     { at: 0, ms: 10000, findings: [{ what: 'a', evidence: 'e', cost: 'c', severity: 'you-should-know' as const }], usage: null, readable: true },
     { at: 0, ms: 20000, findings: [], usage: null, readable: true },
     { at: 0, ms: 30000, findings: [{ what: 'b', evidence: 'e', cost: 'c', severity: 'heads-up' as const }], usage: null, readable: true },
   ])
-  expect(line).toContain('last 3 passes')
-  expect(line).toContain('2 finding(s)')
-  expect(line).toContain('1 worth stopping for')
-  expect(line).toContain('1 found nothing')
-  expect(line).toContain('avg 20s each')
+  expect(line).toContain('最近 3 次审查')
+  expect(line).toContain('发现 2 条')
+  expect(line).toContain('1 条该尽快处理')
+  expect(line).toContain('1 次空手')
+  expect(line).toContain('平均 20 秒')
+  // avg alone is pulled around by the slowest pass — p50/p90 stand next to it.
+  expect(line).toContain('p50 20 秒')
+  expect(line).toContain('p90 30 秒')
+  // A superseded pass is counted as superseded; its findings were never delivered,
+  // so they are not "raised" — neither in the window line nor in the aggregate.
+  const withStale = summarize([
+    { at: 0, ms: 10000, findings: [SEEN], usage: null, readable: true, stale: true },
+    { at: 0, ms: 20000, findings: [SEEN], usage: null, readable: true },
+  ])
+  expect(withStale).toContain('最近 2 次审查:发现 1 条')
+  expect(withStale).toContain('1 次被作废')
+  // The aggregate outlives the 50-entry window: passes, superseded, and the loud/quiet split.
+  const all = summarize([], { passes: 40, findings: 55, loud: 40, quiet: 15, empty: 3, unreadable: 1, stale: 2, msTotal: 40 * 126_000 })
+  expect(all).toContain('累计:审查 40 次(作废 2 次)')
+  expect(all).toContain('发现 55 条 —— 40 条该尽快处理 / 15 条可稍后')
+  expect(all).toContain('平均 126 秒')
 })

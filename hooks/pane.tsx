@@ -11,14 +11,15 @@ import type { Cards, Snapshot } from '../types'
 export const PANE = 'mimo-supervisor'
 
 const EMPTY: Snapshot = {
-  mode: 'auto',
+  mode: 'off',
   watches: false,
   why: 'not looked at yet',
-  every: 6,
+  every: 3,
   told: 0,
   last: '',
   raised: [],
   quietPasses: 0,
+  reviewer: '',
 }
 
 const cards = atom({ plugin: 'mimo-supervisor', key: 'cards' } as const, null)
@@ -33,36 +34,49 @@ export const registerPane = (on: On) => {
 
     return (
       <Box flexDirection="column">
-        <Text bold>{s.watches ? 'watching' : s.mode === 'off' ? 'off' : 'idle'}</Text>
-        <Text dimColor>{s.why}</Text>
-        <Text dimColor>
-          {s.told} noted{s.last === '' ? '' : ` · last: ${s.last}`}
-          {s.watches ? ` · every ${s.every} steps` : ''}
+        <Text bold>
+          {s.watches ? '监视中' : '已停止'}
+          {s.watches ? ` · 每 ${s.every} 步新工作检查一次` : ''}
         </Text>
-        {/* What is being held back from repeating, and how far the checks have
-            stretched while they keep finding nothing. Both live in state, so this
-            line is also how a test sees that a pass wrote them there. */}
+        {/* 审查员和主会话是两个模型,分开写清楚——不然看的人会把主会话
+            的模型名当成审查员的(切到 flash 之后这里最容易误会)。 */}
+        <Text dimColor>审查员 {s.reviewer || '(主模型 fork)'} · {s.why}</Text>
         <Text dimColor>
-          {s.raised.length} remembered · {s.quietPasses} quiet pass{s.quietPasses === 1 ? '' : 'es'}
+          本会话共报出 {s.told} 条提醒{s.last === '' ? '' : ` · 最近一次 ${s.last}`}
+        </Text>
+        {/* 去重记忆:审查员"已经说过"的句子,以后不会再重复提(封顶 24 条)。
+            和上面"报出几条"是两回事——一个是本会话的产出,一个是防复读的记忆。
+            两者都存在会话状态里,这条线也是测试确认 pass 写入了状态的地方。 */}
+        <Text dimColor>
+          去重记忆 {s.raised.length} 条:已说过的不会再重复 · 连续空审查 {s.quietPasses} 次
         </Text>
 
         {shown === null || shown.items.length === 0 ? (
-          <Text dimColor>No findings being held.</Text>
+          <Text dimColor>暂无正在提醒的条目。</Text>
         ) : (
           <Box flexDirection="column" marginTop={1}>
-            <Text bold>latest ({shown.items.length})</Text>
+            <Text bold>
+              正在提醒 {shown.items.length} 条(! 该尽快处理 · ~ 可稍后)
+            </Text>
             {shown.items.slice(-room).map((f, i) => (
               <Box key={`pane-${i}`} flexDirection="column">
                 <Text bold={f.severity === 'you-should-know'} dimColor={f.severity === 'heads-up'}>
                   {f.severity === 'you-should-know' ? '! ' : '~ '}
                   {i + 1}. {f.what}
                 </Text>
-                <Text dimColor>   evidence: {f.evidence}</Text>
-                <Text dimColor>   cost: {f.cost}</Text>
+                <Text dimColor>      证据: {f.evidence}</Text>
+                <Text dimColor>      代价: {f.cost}</Text>
               </Box>
             ))}
           </Box>
         )}
+        {/* 回应图例原先画在横幅上;横幅删了,它跟着搬到这里——
+            否则 learn 1 这些写法就无处可见了。 */}
+        <Box marginTop={1}>
+          <Text dimColor wrap="truncate-end">
+            回应(下一条消息里打):learn 1 知道了 · dismiss 1 不相关 · more like 1 多来点 · learn all 全部关掉 · undo &lt;n&gt; 放出
+          </Text>
+        </Box>
       </Box>
     )
   })

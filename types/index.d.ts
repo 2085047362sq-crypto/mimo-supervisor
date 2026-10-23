@@ -31,11 +31,11 @@ export type Cards = {
  * stretched out are kept here and read back at session.start.
  */
 export type Snapshot = {
-  mode: 'auto' | 'on' | 'off'
+  mode: 'on' | 'off'
   watches: boolean
   /** Why it says so: the model it saw, or the endpoint when it saw no model. */
   why: string
-  /** The interval between passes right now, which widens while they find nothing. */
+  /** The interval between passes, in steps of new work. Fixed — nothing widens it in this build. */
   every: number
   /** Findings raised this session. */
   told: number
@@ -43,8 +43,10 @@ export type Snapshot = {
   last: string
   /** What has been said already, so a reload does not make the watcher say it again. */
   raised: Finding[]
-  /** Consecutive passes that found nothing, which is what widens the interval. */
+  /** Consecutive passes that found nothing — informational, shown in the pane; nothing widens on it. */
   quietPasses: number
+  /** The reviewer's own model (empty = the main model via fork). Shown apart from `why`, which names the session's model. */
+  reviewer: string
 }
 
 /**
@@ -53,13 +55,12 @@ export type Snapshot = {
  * again in every conversation that follows. A reload of the module picks the choice
  * straight back up, since the store is the host's and outlives the module.
  */
-export type Mode = 'off' | 'on' | 'auto'
+export type Mode = 'off' | 'on'
 
 declare module 'claude-code' {
   interface PluginState {
     'mimo-supervisor': {
       cards: Cards | null
-      isHidden: boolean
       snapshot: Snapshot
     }
   }

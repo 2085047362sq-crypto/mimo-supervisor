@@ -42,6 +42,39 @@ export const addOne = (list: readonly FeedbackEntry[], what: string, at: number)
 export const dropOne = (list: readonly FeedbackEntry[], index: number): [FeedbackEntry[] | undefined, FeedbackEntry | undefined] =>
   index < 0 || index >= list.length ? [undefined, undefined] : [list.filter((_, j) => j !== index), list[index]]
 
+/**
+ * The undo path: one numbering across the three lists, ordered **oldest closed first**
+ * (`at` ascending). That ordering is what keeps the numbers stable — a newly closed
+ * item appends at the tail, so what `undo 2` points at today is still what it points at
+ * tomorrow. A list-order concatenation would silently shift every later number the
+ * moment one more item landed in an earlier list.
+ */
+export type Closed = { learned: readonly FeedbackEntry[]; dismissed: readonly FeedbackEntry[]; appreciated: readonly FeedbackEntry[] }
+
+export type ClosedRow = { kind: FeedbackKind; entry: FeedbackEntry }
+
+export const closedRows = (lists: Closed): ClosedRow[] =>
+  [
+    ...lists.learned.map((entry) => ({ kind: 'learned' as const, entry })),
+    ...lists.dismissed.map((entry) => ({ kind: 'dismissed' as const, entry })),
+    ...lists.appreciated.map((entry) => ({ kind: 'appreciated' as const, entry })),
+  ].sort((a, b) => a.entry.at - b.entry.at || a.kind.localeCompare(b.kind) || a.entry.what.localeCompare(b.entry.what))
+
+export const dropAt = (
+  lists: Closed,
+  index: number
+): { kind: FeedbackKind; entry: FeedbackEntry; next: FeedbackEntry[] } | undefined => {
+  const hit = closedRows(lists)[index]
+  if (hit === undefined) return undefined
+  const at = lists[hit.kind].findIndex((f) => f === hit.entry || (f.at === hit.entry.at && f.what === hit.entry.what))
+  if (at < 0) return undefined
+  const [next, gone] = dropOne(lists[hit.kind], at)
+  return gone !== undefined && next !== undefined ? { kind: hit.kind, entry: gone, next } : undefined
+}
+
+/** How many items are closed in total — the numbering `dropAt` indexes. */
+export const closedCount = (lists: Closed) => lists.learned.length + lists.dismissed.length + lists.appreciated.length
+
 /** The sentences, which is all the reviewer's prompt needs. */
 export const sentences = (list: readonly FeedbackEntry[]) => list.map((f) => f.what)
 
@@ -127,9 +160,15 @@ export const looksLikeAnswer = (text: string): boolean => {
   const verb = /^\s*(learn|known|dismiss|not mine|not relevant|more like|more of)\b[\s:,-]*/i.exec(line)
   if (!verb) return false
   const rest = line.slice(verb[0].length).trim().replace(/[.!?。！？]+$/, '')
-  // The same two shapes targetsOf accepts: nothing at all (which asks), a place
-  // (`1`, `1,2`), or a quote. Anything else is a request and reaches the model.
-  return rest === '' || /^\d+([\s,，、]+\d+)*$/.test(rest) || /^["'“”「」].+["'“”「」]$/.test(rest)
+  // The same shapes targetsOf accepts: nothing at all (which asks), a place
+  // (`1`, `1,2`), a quote, or "all" — the batch commands are gone, so `learn all`
+  // is the only way to close everything on screen and it must not leak to the model.
+  return (
+    rest === '' ||
+    /^\d+([\s,，、]+\d+)*$/.test(rest) ||
+    /^["'“”「」].+["'“”「」]$/.test(rest) ||
+    /^(all|both|everything|所有|全部)$/i.test(rest)
+  )
 }
 
 export const parseAnswer = (text: string, items: readonly { what: string }[]): Answer | null => {

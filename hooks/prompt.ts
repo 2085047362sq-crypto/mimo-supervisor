@@ -48,7 +48,7 @@ export const watchPrompt = (raised: readonly Finding[] = [], fb: FeedbackSets = 
     '## When to say nothing',
     '- **An empty list is the normal, good outcome.** Most passes should answer {"findings": []}. Finding nothing means the work is going well.',
     '- A process lesson (measure before asserting, read the data first, ask before deciding, verify before reporting done) earns **one** mention for the whole conversation. After that it is noise. The same lesson reworded is still the same lesson — raising it again is you repeating yourself, not being thorough.',
-    '- Reserve `you-should-know` for something that would make the **user\'s result** wrong. A lesson about how the assistant works is `heads-up` at most — and is usually worth saying nothing about once it has been said.',
+    '- Reserve `you-should-know` for something that would make the **user\'s result** wrong. A lesson about how the assistant works is `heads-up` at most — and is usually worth saying nothing about once it has been said. In practice most items are `heads-up`; if you mark two `you-should-know` in a row, re-check both.',
     '- If the last few passes each found something, raise the bar: you are probably re-reporting process nits. Prefer empty.',
     '- An item earns its place only if the assistant would act differently after reading it. If the next step is the same either way, leave it out.',
     '- Skip anything the assistant already told the user, already fixed, or is plainly about to do.',

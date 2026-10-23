@@ -2,7 +2,7 @@
 
 **Puts "You should know" back into a Claude Code running mimo-v2.6-pro.**
 
-Every few steps it forks one review pass over the session's work so far. When it finds something the model should handle now, it tells the model, and shows you the same items in a band above the prompt.
+Every few steps it runs one review pass over the session's work so far. The reviewer runs on **mimo-v2.6-flash** (Mify ¥1/¥2) by default: `fork` cannot change models, so the pass goes through `complete` with the conversation assembled — fast enough to land inside the turn it looks at. A failing reviewer model falls back to the main model and says so; `reviewer mimo|flash|<id>` switches. When it finds something the model should handle now, it tells the model, and shows you the same items in the pane on the right (the pane was cut — the pane carried everything it showed).
 
 **Installed but dormant.** The plugin is always there and its command is always available, but type nothing and it does nothing — no review, no cost, no interruption. Ask for it and it watches that one conversation.
 
@@ -18,7 +18,7 @@ Design references [deepseek-supervisor](https://github.com/LACAN-1/deepseek-supe
 
 ## What it does
 
-Every **3** finished steps of the main loop (a subagent's steps are its own) it forks a review. **The interval is fixed** — say 3 steps and it is 3 steps, never quietly widened just because a pass found nothing. For the fork-saving behaviour instead, `/mimo-supervisor interval auto` turns on "doubles to 24 while passes find nothing, back to the base on the first finding". It looks for only these:
+Every **3** finished steps of the main loop (a subagent's steps are its own) it forks a review. **The interval is fixed** — say 3 steps and it is 3 steps, never quietly widened just because a pass found nothing. (One honest wrinkle: a *chained* check also needs at least 6 steps of new work since the last one landed, so two passes in a row do not poke at one wave of work. The first check of a conversation honours the number exactly.) It looks for only these:
 
 - **A reading picked silently**: the request allows two readings that change the result, and the model built on one without asking.
 - **A problem noticed and not raised**: it saw something wrong and moved on without telling you.
@@ -44,7 +44,7 @@ The reviewer reads the whole transcript, including your file contents and comman
 Findings go two places:
 
 - **To the model**, as a note it reads at its next step. The note says plainly that this is a reviewer's observation and not your instruction, authorizing nothing beyond what you asked for — because the transcript it reads may contain text from the web.
-- **To you**, in a band above the prompt with a **Hide** button. It clears after two of your prompts, like "You should know" cards.
+- **To you**, in the pane on the right (the pane was cut — the pane carried everything it showed) with a **Hide** button. It clears after two of your prompts, like "You should know" cards.
 
 ## How it recognises mimo
 
@@ -61,38 +61,37 @@ If the name matches `mimo`, it works. **Only when neither layer yields a name** 
 
 | | |
 |---|---|
-| Status pane | A `Pane` showing `watching`/`off`/`idle`, the reason, the current interval, the running count, and **the recent items with their evidence and cost**. **There is no status line any more**: the host draws a `$.ui.status` text with a warning glyph in front of it and offers no way to ask for one without, so the state moved to a pane |
+| Status pane | A `Pane` (in Chinese) showing `监视中`/`已停止`, the reason, the current interval, the running count, and **the recent items with their evidence and cost**. **There is no status line any more**: the host draws a `$.ui.status` text with a warning glyph in front of it and offers no way to ask for one without, so the state moved to a pane |
 | `/mimo-supervisor` | **This is the switch.** The bare command starts watching and opens the pane. The plugin is installed but dormant — type nothing and it does nothing |
-| `/mimo-supervisor off` | Stop watching, and clear the band above the prompt |
-| `/mimo-supervisor on` / `auto` | The same, stated plainly; `auto` watches only when the model is mimo |
-| `/mimo-supervisor show` | Bring the band back. Hide only stops drawing it; the items are held until two prompts age them out |
-| `/mimo-supervisor log` | Last 10 passes, with findings and how long each took |
+| `/mimo-supervisor off` | Stop watching, and clear the pane |
+| `/mimo-supervisor log` | Last 10 passes with findings and how long each took, plus what is closed |
+| `/mimo-supervisor interval <n>` | Fix the interval at n steps of new work (1–24). A number you pick is used **exactly** — empty passes do not widen it. A chained check still needs 6 steps of new work since the last one landed |
+| `/mimo-supervisor undo <n>` | Reopen a closed item — the numbering is the one `log` prints (oldest closed first, so the numbers do not shift) |
 
 ### Feedback (entirely optional — ignoring it is fine)
 
-**You do not have to do anything.** The plugin flags what it notices and the band clears itself. Everything below is only for when you *want* to steer it — leave it alone and it works exactly the same.
+**You do not have to do anything.** The plugin flags what it notices and the held items age out (after two of your prompts, or when the next finding lands). Everything below is only for when you *want* to steer it.
 
-When you do want it quieter or louder, say it in the next thing you type (no buttons to press):
+Answer the pane in the next thing you type — no buttons to press. The line is taken out of your prompt (a drop), so it never reaches the model:
 
-| Command | What it says | Afterwards |
+| In your next message | What it says | Afterwards |
 |---|---|---|
-| `/mimo-supervisor learn` | "I know about this one" | **never raised again**, in any wording (harder than "already raised") |
-| `/mimo-supervisor dismiss` | "Not for me" | not raised again |
-| `/mimo-supervisor appreciate` | **"More like this"** | this kind keeps being raised, and comes first |
-| `/mimo-supervisor learned` / `dismissed` / `appreciated` | see what each list holds |
-| `/mimo-supervisor unlearn \| undismiss \| unappreciate <n>` | take one off again |
+| `learn 1` (or `learn "…"` quoting the item) | "I know about this one" | **never raised again**, in any wording (harder than "already raised") |
+| `dismiss 1` | "Not for me" | not raised again |
+| `more like 1` | **"More like this"** | this kind keeps being raised |
 
-All three are remembered **per working directory**, so one project's answer says nothing about another's.
-| `/mimo-supervisor interval <n>` | Fix the interval at n steps (1–24). **Lower it and the review starts earlier in a turn, so it can land inside that turn**. A number you pick is used **exactly** — empty passes do not widen it |
-| `/mimo-supervisor interval auto` | The fork-saving mode: from 3 steps, doubling to 24 while passes find nothing, back to the base on the first finding |
+All three are remembered **per working directory**, so one project's answer says nothing about another's. `log` lists what is closed and `undo <n>` takes one back off.
 
 **It remembers the last thing you chose.** Type `/mimo-supervisor` once and every conversation after that starts watching on its own; type `off` and they all start dormant. You do not retype the command in each one.
 
-The plugin's store (`$.store`) is shared by **every session on this machine**, so a change reaches all of them. It holds two things:
+The plugin's store (`$.store`) is shared by **every session on this machine**, so a change reaches all of them. It holds:
 
 | Key | What | Note |
 |---|---|---|
+| `modes` | the on/off switch, per working directory | **per project** |
+| `learned` / `dismissed` / `appreciated` | the three feedback lists | **per project** |
 | `history` | the last 50 passes, with the evidence each finding quotes | `/mimo-supervisor log` reads it |
+| `agg` | all-time counters (passes / findings / loud-quiet / superseded / wall-clock) that never roll off | global |
 | `every` | the interval you set with `interval` | **change it once and every session changes** |
 
 All of it stays on this machine and is sent nowhere.
@@ -103,7 +102,7 @@ The session's own memory (what has been said, the backoff level, the counts) liv
 
 - **Claude Code 2.1.290 or later.** Developed and tested on **2.1.293**.
 
-That floor is real, not decorative. The plugin uses `$.model.fork` (the review pass), `$.session.append` (delivering findings to the model), `AbovePrompt` (the band) and `atom`/`update`/`read` (state) — **none of which exist in 2.1.246**, where it would silently do nothing. 2.1.246's plugin API is a much smaller, different thing (`model.complete`, `session.messages`, `store.get` and little else); targeting it means rewriting the plugin rather than porting it.
+That floor is real, not decorative. The plugin uses `$.model.fork` (the review pass), `$.session.append` (delivering findings to the model), `AbovePrompt` (the pane) and `atom`/`update`/`read` (state) — **none of which exist in 2.1.246**, where it would silently do nothing. 2.1.246's plugin API is a much smaller, different thing (`model.complete`, `session.messages`, `store.get` and little else); targeting it means rewriting the plugin rather than porting it.
 
 ## Install
 
@@ -141,7 +140,7 @@ Every pass forks the whole session and re-reads the full context. **Whether that
 
 Measured through this machine's local proxy: a fork reports `input_tokens` and `cache_read_input_tokens` of **both 0**, so cost cannot be derived from tokens at all. And per the API docs, a fork whose `cache_read_input_tokens` is near zero usually means the cache missed and **the whole transcript prefix was billed at full price** — the expensive case, not the "mostly cache hits" the original README assumed.
 
-So `/mimo-supervisor log` records **wall-clock milliseconds** (measured at 11–14s per pass) with the raw usage attached but not turned into money. One measured data point: an 11-second pass returned `{"findings": []}`. The widening interval exists to amortise exactly that. Do the arithmetic before turning it on.
+So `/mimo-supervisor log` records **wall-clock milliseconds** per pass, with the raw usage attached but not turned into money. How long is a pass? Measured over 50 real passes: **p50 126s, p90 227s, max 302s** — minutes, not seconds, because the fork re-reads the whole transcript and slows down as the conversation grows. (The earlier "11–14s per pass" figure was an early short-session sample and is obsolete; do not size anything on it.) The widening interval exists to amortise exactly that. Do the arithmetic before turning it on.
 
 ## What changed
 
@@ -151,7 +150,7 @@ So `/mimo-supervisor log` records **wall-clock milliseconds** (measured at 11–
 | Items per pass | prompt said 2, parser kept 3 | 2 in both (`MAX_ITEMS`) |
 | Remembers raised items | last 12; the author saw repeats | last 24 |
 | "Default to silence" | one line | its own rule, requiring an item to change the next action, banning hedged items |
-| Interval between passes | fixed at 6 steps | fixed at **3** by default; `interval auto` is what turns on "doubles to 24 while passes find nothing" |
+| Interval between passes | fixed at 6 steps | fixed at **3** by default (`interval <n>` changes it; empty passes never do) |
 | A fork that hangs | no back-out; `isWatching` sticks forever | a 120s guard lets the next one run |
 | Cost recorded | token counts | wall-clock ms plus raw usage (this gateway reports tokens as 0) |
 | Already-raised block | resent with what + evidence + cost | `what` alone |
@@ -162,7 +161,7 @@ The seven-item checklist is **unchanged**. It is model-agnostic and it is the mo
 
 ## Known limits
 
-- **The review may not land inside the turn it looks at.** The fork takes 11–14s to come back, and a turn can end in a few steps, where the finding only reaches the **next** turn. The default of 3 steps is a worked-out compromise; `interval 2` starts it earlier and so lands it more often in-turn, at the price of more forks over the same work.
+- **The review may not land inside the turn it looks at.** A fork takes minutes on a long transcript (p50 126s / p90 227s over 50 real passes — the old 11–14s was a short-session sample and is obsolete), and a turn can end in a few steps, where the finding only reaches a **later** turn. The default of 3 steps is a worked-out compromise for density, not latency; `interval 2` starts reviews earlier, at the price of more forks over the same work.
 - **The pane's first appearance in a narrow terminal.** The one opened at session start seats only from 144 columns; it is now also re-opened behind **your first prompt**, and a pane that was asked for seats at any width, so a narrow terminal gets it from the first message on.
 - **The decision cache lags until the next prompt.** "Is this worth watching" is worked out once per prompt, so switching model with `/model` mid-session is picked up at the next prompt, not before.
 - **Cost is still an estimate.** This gateway reports no tokens; only wall-clock is real.
@@ -176,16 +175,15 @@ claude plugin validate .
 claude plugin test .
 ```
 
-Claude Code writes the type declarations into `.claude-plugin/types/` the first time it loads the plugin; after that `tsc -p .` type-checks. Currently **34 tests, all passing**.
+Claude Code writes the type declarations into `.claude-plugin/types/` the first time it loads the plugin; after that `tsc -p .` type-checks. Currently **41 tests, all passing**.
 
 | File | What it does |
 |---|---|
-| `hooks/register.ts` | step counting and backoff, the review pass, the watchdog, model detection, the note to the model, on/off/auto, the command |
+| `hooks/register.ts` | step counting and the chain floor, the review pass, the watchdog, model detection, the note to the model, on/off, the command |
 | `hooks/prompt.ts` | the review prompt, and parsing the model's answer |
-| `hooks/band.tsx` | the band above the prompt |
 | `hooks/pane.tsx` | the status pane, which replaced a status line the host marked with a warning glyph |
 | `types/index.d.ts` | the finding shape and the plugin state contract |
-| `tests/watch.test.ts` | 34 tests on Claude Code's plugin test kit |
+| `tests/watch.test.ts` | 41 tests on Claude Code's plugin test kit |
 
 ## License
 
